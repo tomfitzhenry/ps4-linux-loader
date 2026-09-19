@@ -25,6 +25,8 @@
 
 void* dlopen(const char*, int);
 void* dlsym(void*, const char*);
+long long dynlib_load_prx(const char*, int, int*, int);
+long long dynlib_dlsym(int, const char*, void**);
 
 typedef int (*t_sysctlbyname)(const char *, void *, size_t *, const void *, size_t);
 void thr_exit(long *state);
