@@ -16,6 +16,8 @@
 #include <sys/thr.h>
 #include <time.h>
 #include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include "sb_detect.h"
 
 
@@ -300,16 +302,204 @@ void kernel_main(void)
 #ifndef HDD_SECOND_BOOT_PATH
 #define HDD_SECOND_BOOT_PATH "/user/system/boot/"
 #endif
+#ifndef NETBOOT_MAX
+#define NETBOOT_MAX (64UL << 20)
+#endif
+
+/*
+ * Optional HTTP netboot. netboot.txt (looked up like the other boot files)
+ * may hold the base URL of an HTTP server, e.g. "http://172.17.1.169:8000".
+ * When set, every boot file is fetched over HTTP first and only then falls
+ * back to USB/HDD, so the files can be swapped on the server without an FTP
+ * round-trip to the console.
+ */
+static char *g_netboot_url = (char *)0;
+
+static int net_atoi10(const char *s)
+{
+    int v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    return v;
+}
+
+/* Dotted quad -> s_addr bytes in host order (little-endian x86). */
+static int net_parse_ipv4(const char *s, unsigned int *out)
+{
+    unsigned int v = 0, part;
+    int i, d;
+
+    for (i = 0; i < 4; i++) {
+        part = 0; d = 0;
+        while (*s >= '0' && *s <= '9') {
+            part = part * 10 + (unsigned int)(*s - '0');
+            s++; d++;
+        }
+        if (!d || part > 255) return -1;
+        v |= part << (8 * i);
+        if (i < 3) {
+            if (*s != '.') return -1;
+            s++;
+        }
+    }
+    if (*s) return -1;
+    *out = v;
+    return 0;
+}
+
+static int net_append(char *dst, const char *src)
+{
+    int n = 0;
+    while (src[n]) { dst[n] = src[n]; n++; }
+    return n;
+}
+
+static int net_send_all(int s, const char *buf, unsigned long len)
+{
+    unsigned long off = 0;
+
+    while (off < len) {
+        long n = sendto(s, buf + off, len - off, 0, (const struct sockaddr *)0, 0);
+        if (n <= 0) return -1;
+        off += (unsigned long)n;
+    }
+    return 0;
+}
+
+static int http_get(const char *base, const char *name, char **ptr,
+                    unsigned long long *sz)
+{
+    const char *p = base, *scheme = "http://";
+    char host[64], path[192], req[512];
+    unsigned int ip = 0;
+    int hi = 0, pl = 0, port = 80, s, i, rl;
+    unsigned long cap, total;
+    char *buf;
+    struct sockaddr_in sa;
+
+    for (i = 0; i < 7; i++)
+        if (p[i] != scheme[i]) return -1;
+    p += 7;
+
+    while (*p && *p != ':' && *p != '/' && hi < 63) host[hi++] = *p++;
+    host[hi] = '\0';
+    if (*p == ':') {
+        p++;
+        port = net_atoi10(p);
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    while (*p && pl < 190) path[pl++] = *p++;
+    if (pl == 0 || path[pl - 1] != '/') path[pl++] = '/';
+    for (i = 0; name[i] && pl < 190; i++) path[pl++] = name[i];
+    path[pl] = '\0';
+
+    if (!hi || port <= 0 || port > 65535) return -1;
+    if (net_parse_ipv4(host, &ip) != 0) return -1;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+
+    for (i = 0; i < (int)sizeof(sa); i++) ((char *)&sa)[i] = 0;
+    sa.sin_len = sizeof(sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = (unsigned short)(((port & 0xff) << 8) | (port >> 8));
+    sa.sin_addr.s_addr = ip;
+
+    if (connect(s, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(s);
+        return -1;
+    }
+
+    rl = 0;
+    rl += net_append(req + rl, "GET ");
+    rl += net_append(req + rl, path);
+    rl += net_append(req + rl, " HTTP/1.0\r\nHost: ");
+    rl += net_append(req + rl, host);
+    rl += net_append(req + rl, "\r\nConnection: close\r\n\r\n");
+    if (net_send_all(s, req, (unsigned long)rl) != 0) { close(s); return -1; }
+
+    cap = 1UL << 20;
+    buf = mmap(NULL, cap, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)buf <= 0) { close(s); return -1; }
+    total = 0;
+    for (;;) {
+        long n;
+        if (total == cap) {
+            unsigned long ncap = cap << 1;
+            char *nb;
+            if (ncap > NETBOOT_MAX) { close(s); return -1; }
+            nb = mmap(NULL, ncap, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if ((long)nb <= 0) { close(s); return -1; }
+            for (i = 0; (unsigned long)i < total; i++) nb[i] = buf[i];
+            buf = nb; cap = ncap;
+        }
+        n = recvfrom(s, buf + total, cap - total, 0,
+                     (struct sockaddr *)0, (socklen_t *)0);
+        if (n < 0) { close(s); return -1; }
+        if (n == 0) break;
+        total += (unsigned long)n;
+    }
+    close(s);
+    if (total < 12) return -1;
+
+    /* Expect "HTTP/1.x 2xx ...". */
+    if (buf[0] != 'H' || buf[4] != '/' ||
+        buf[9] != '2' || buf[10] != '0' || buf[11] != '0')
+        return -1;
+
+    for (i = 0; (unsigned long)(i + 3) < total; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            i += 4;
+            break;
+        }
+    }
+    if ((unsigned long)i >= total) return -1;
+
+    /* Move the body to the start of the (page-aligned) mapping. */
+    total -= (unsigned long)i;
+    for (rl = 0; (unsigned long)rl < total; rl++) buf[rl] = buf[i + rl];
+
+    *ptr = buf;
+    *sz = (unsigned long long)total;
+    return 0;
+}
+
+static int read_file_in(const char *dir, const char *name, char **ptr,
+                        unsigned long long *sz)
+{
+    char path[160];
+    int n = 0, i;
+
+    for (i = 0; dir[i] && n < 150; i++) path[n++] = dir[i];
+    for (i = 0; name[i] && n < 150; i++) path[n++] = name[i];
+    path[n] = '\0';
+    return read_file(path, ptr, sz);
+}
+
+static int load_file(const char *name, char **ptr, unsigned long long *sz)
+{
+    if (g_netboot_url && http_get(g_netboot_url, name, ptr, sz) == 0)
+        return 0;
+    if (read_file_in("/mnt/usb0/", name, ptr, sz) == 0) return 0;
+    if (read_file_in("/mnt/usb1/", name, ptr, sz) == 0) return 0;
+    if (read_file_in(HDD_BOOT_PATH, name, ptr, sz) == 0) return 0;
+    if (read_file_in(HDD_SECOND_BOOT_PATH, name, ptr, sz) == 0) return 0;
+    return -1;
+}
 
 int get_sb_id() {
     static t_sysctlbyname p_sysctlbyname = NULL;
 
     if (!p_sysctlbyname) {
-        // Resolve it from libkernel.sprx which is always loaded
-        void* handle = dlopen("libkernel.sprx", 0); 
-        if (!handle) handle = dlopen("/system/common/lib/libkernel.sprx", 0);
-        
-        p_sysctlbyname = (t_sysctlbyname)dlsym(handle, "sysctlbyname");
+        // Use dynlib directly: dlopen() bails out for libkernel because
+        // dynlib_get_info_ex fails on it.
+        int handle = 0;
+        if (dynlib_load_prx("libkernel.sprx", 0, &handle, 0) == 0 && handle)
+            dynlib_dlsym(handle, "sysctlbyname", (void**)&p_sysctlbyname);
+        if (!p_sysctlbyname)
+            dynlib_dlsym(0x2001, "sysctlbyname", (void**)&p_sysctlbyname);
     }
 
     if (p_sysctlbyname) {
@@ -374,15 +564,23 @@ int main(void)
     char *vramstr = NULL; unsigned long long vramstr_size = 0;
     int vram_mb = 0;
 
+    // Optional HTTP netboot: netboot.txt (USB/HDD) holds the server base URL.
+    {
+        char *nb = NULL; unsigned long long nbsz = 0;
+        if ((read_file("/mnt/usb0/netboot.txt", &nb, &nbsz) == 0)
+         || (read_file("/mnt/usb1/netboot.txt", &nb, &nbsz) == 0)
+         || (read_file(HDD_BOOT_PATH "netboot.txt", &nb, &nbsz) == 0)
+         || (read_file(HDD_SECOND_BOOT_PATH "netboot.txt", &nb, &nbsz) == 0)) {
+            unsigned long long i;
+            for (i = 0; i < nbsz; i++)
+                if (nb[i] == '\n' || nb[i] == '\r') { nb[i] = '\0'; break; }
+            if (nb[0]) g_netboot_url = nb;
+        }
+    }
+
 #define L(name, where, wheresz, is_fatal) \
-    if (read_file("/mnt/usb0/" name, where, wheresz) \
-     && read_file("/mnt/usb1/" name, where, wheresz) \
-     && read_file(HDD_BOOT_PATH name, where, wheresz) \
-     && read_file(HDD_SECOND_BOOT_PATH name, where, wheresz) \
-     && is_fatal) { \
-        alert("Failed to load file: " name "\nChecked paths:\n" \
-                "/mnt/usb0/" name "\n/mnt/usb1/" name "\n" \
-                HDD_BOOT_PATH name "\n" HDD_SECOND_BOOT_PATH name); \
+    if (load_file(name, where, wheresz) && is_fatal) { \
+        alert("Failed to load file: " name); \
         return 1; \
     }
 
