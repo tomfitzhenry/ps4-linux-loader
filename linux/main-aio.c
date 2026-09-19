@@ -25,6 +25,7 @@
 
 void* dlopen(const char*, int);
 void* dlsym(void*, const char*);
+long long dynlib_dlsym(int, const char*, void**);
 
 typedef int (*t_sysctlbyname)(const char *, void *, size_t *, const void *, size_t);
 void thr_exit(long *state);
@@ -303,11 +304,8 @@ int get_sb_id() {
     static t_sysctlbyname p_sysctlbyname = NULL;
 
     if (!p_sysctlbyname) {
-        // Resolve it from libkernel.sprx which is always loaded
-        void* handle = dlopen("libkernel.sprx", 0); 
-        if (!handle) handle = dlopen("/system/common/lib/libkernel.sprx", 0);
-        
-        p_sysctlbyname = (t_sysctlbyname)dlsym(handle, "sysctlbyname");
+        // 0x2001 is libkernel's module id; resolve its export directly.
+        dynlib_dlsym(0x2001, "sysctlbyname", (void**)&p_sysctlbyname);
     }
 
     if (p_sysctlbyname) {
