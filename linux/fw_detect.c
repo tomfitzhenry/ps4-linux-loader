@@ -84,10 +84,70 @@ extern long     lseek(int fd, long offset, int whence);
 
 static u16 g_firmware = 0;
 
+/*
+ * libkernel-based detection. Unlike reading /system/common/lib/libc.sprx
+ * directly, calling sceKernelGetSystemSwVersion() works from a sandboxed
+ * process (e.g. a payload run by Payload Guest), which is exactly the
+ * case where the file read fails.
+ *
+ * 0x2001 is libkernel's module id: libkernel is resident, so its exports are
+ * resolved by id rather than by loading it as a PRX.
+ * https://gist.github.com/flatz/1055a8d7819c8478db1b464842582c9c
+ */
+long long dynlib_dlsym(int, const char*, void**);
+
+typedef struct {
+    u64 unk1;
+    char version_string[0x1C];
+    u32 version;
+} SceFwInfo;
+
+static u16 fw_from_version_string(const char* s)
+{
+    u32 maj = 0, min = 0;
+    int i = 0;
+
+    while (s[i] >= '0' && s[i] <= '9') { maj = maj * 10 + (u32)(s[i] - '0'); i++; }
+    if (s[i] == '.') i++;
+    /* Minor field is zero-padded to three digits, e.g. "710" or "050". */
+    if (s[i] >= '0' && s[i] <= '9') { min = (u32)(s[i] - '0') * 10; i++; }
+    if (s[i] >= '0' && s[i] <= '9') min += (u32)(s[i] - '0');
+
+    return (u16)(maj * 100 + min);
+}
+
+static u16 get_firmware_libkernel(void)
+{
+    typedef int (*t_getver)(SceFwInfo*);
+    t_getver getver = (t_getver)0;
+    SceFwInfo info;
+    unsigned i;
+
+    dynlib_dlsym(0x2001, "sceKernelGetSystemSwVersion", (void**)&getver);
+    if (!getver)
+        return 0;
+
+    for (i = 0; i < sizeof(info); i++)
+        ((u8*)&info)[i] = 0;
+
+    if (getver(&info) != 0)
+        return 0;
+
+    return fw_from_version_string(info.version_string);
+}
+
 u16 get_firmware(void)
 {
     if (g_firmware)
         return g_firmware;
+
+    {
+        u16 v = get_firmware_libkernel();
+        if (v) {
+            g_firmware = v;
+            return v;
+        }
+    }
 
     int fd = open("/system/common/lib/libc.sprx", O_RDONLY, 0);
     if (fd < 0)
