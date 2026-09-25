@@ -85,19 +85,27 @@ extern long     lseek(int fd, long offset, int whence);
 static u16 g_firmware = 0;
 
 /*
- * libkernel-based detection. Unlike reading /system/common/lib/libc.sprx
- * directly, calling sceKernelGetSystemSwVersion() works from a sandboxed
- * process (e.g. a payload run by Payload Guest), which is exactly the
- * case where the file read fails.
+ * ISOLATION TEST BUILD. Resolve libkernel exports through dlopen()/dlsym()
+ * only: the raw dynlib fallback and the file fallback are both removed, so a
+ * successful boot proves lib/dl.c makes dlopen("libkernel.sprx") work.
  */
-long long dynlib_load_prx(const char*, int, int*, int);
-long long dynlib_dlsym(int, const char*, void**);
+void* dlopen(const char*, int);
+void* dlsym(void*, const char*);
 
 typedef struct {
     u64 unk1;
     char version_string[0x1C];
     u32 version;
 } SceFwInfo;
+
+static void* libkernel_sym(const char* name)
+{
+    void* handle = dlopen("libkernel.sprx", 0);
+
+    if (!handle)
+        return (void*)0;
+    return dlsym(handle, name);
+}
 
 static u16 fw_from_version_string(const char* s)
 {
@@ -116,15 +124,11 @@ static u16 fw_from_version_string(const char* s)
 static u16 get_firmware_libkernel(void)
 {
     typedef int (*t_getver)(SceFwInfo*);
-    t_getver getver = (t_getver)0;
     SceFwInfo info;
-    int h = 0;
+    t_getver getver;
     unsigned i;
 
-    if (dynlib_load_prx("libkernel.sprx", 0, &h, 0) == 0 && h)
-        dynlib_dlsym(h, "sceKernelGetSystemSwVersion", (void**)&getver);
-    if (!getver)
-        dynlib_dlsym(0x2001, "sceKernelGetSystemSwVersion", (void**)&getver);
+    getver = (t_getver)libkernel_sym("sceKernelGetSystemSwVersion");
     if (!getver)
         return 0;
 
@@ -150,7 +154,9 @@ u16 get_firmware(void)
         }
     }
 
-    int fd = open("/system/common/lib/libc.sprx", O_RDONLY, 0);
+    /* ISOLATION TEST BUILD: the file fallback is disabled on purpose, so the
+     * only way to detect firmware is the dlopen()'d libkernel call. */
+    int fd = open("/isolation-test/no/libc.sprx", O_RDONLY, 0);
     if (fd < 0)
         return 0;
 

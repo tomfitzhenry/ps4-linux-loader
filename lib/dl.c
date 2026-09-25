@@ -44,10 +44,16 @@ void* dlopen_ex(const char* path, int mode /*ignored*/, void* data, size_t data_
         return 0;
     struct module_info_ex mi;
     mi.st_size = sizeof(mi);
-    if(dynlib_get_info_ex(handle, 0, &mi))
-        return 0;
-    if(mi.ref_count < 2)
-        ((int(*)(size_t, void*, void*))mi.init_proc_addr)(data_len, data, 0);
+    /*
+     * libkernel is always resident and dynlib_get_info_ex() rejects it, but
+     * the handle is still valid for dynlib_dlsym(). Don't discard it, and
+     * skip the init call when the module info is unavailable: a resident
+     * module has already been initialised.
+     */
+    if(dynlib_get_info_ex(handle, 0, &mi) == 0) {
+        if(mi.ref_count < 2)
+            ((int(*)(size_t, void*, void*))mi.init_proc_addr)(data_len, data, 0);
+    }
     return (void*)(long long)handle;
 }
 
